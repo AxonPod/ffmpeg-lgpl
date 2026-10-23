@@ -1,0 +1,156 @@
+# Builds FFmpeg with build.sh on every platform; for a tag, publishes the
+# builds as a release: one archive per platform, the source archive (this
+# repository's files and every pinned upstream tarball, the LGPL's
+# corresponding source) and SHA256SUMS. A pull request or a push to main
+# builds without publishing.
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: linux-x86_64, runner: ubuntu-24.04, container: 'ubuntu:26.04' }
+          - { platform: linux-aarch64, runner: ubuntu-24.04-arm, container: 'ubuntu:26.04' }
+          - { platform: windows-x86_64, runner: windows-2022 }
+          - { platform: macos-arm64, runner: macos-14 }
+    runs-on: ${{ matrix.runner }}
+    # Linux in a plain Ubuntu 26.04, whatever the runner's image: the
+    # libraries link that release's libva and glibc.
+    container: ${{ matrix.container }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # Node for the JavaScript actions under act (nektos/act runs the job
+      # in this container as it is; GitHub's runner brings its own).
+      - name: Tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            ca-certificates curl git build-essential pkg-config cmake meson ninja-build \
+            nasm patchelf libva-dev libdrm-dev zlib1g-dev nodejs
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # git describe names the revision
+
+      - name: Tools (macOS)
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+          HOMEBREW_NO_INSTALL_CLEANUP: 1
+        run: brew install nasm meson ninja
+
+      - name: MSYS2 (Windows)
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2.33.0
+        with:
+          msystem: UCRT64
+          update: false
+          install: >-
+            make diffutils
+            mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-nasm mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-meson mingw-w64-ucrt-x86_64-ninja mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-zlib
+
+      - name: Name
+        id: name
+        run: |
+          # The checkout belongs to the runner's user, not the container's.
+          git config --global --add safe.directory "$PWD"
+          echo "revision=$(git describe --tags --always)" >>"$GITHUB_OUTPUT"
+
+      - name: Build
+        if: runner.os != 'Windows'
+        env:
+          REVISION: ${{ steps.name.outputs.revision }}
+        run: ./build.sh
+
+      - name: Build (MSYS2)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        env:
+          REVISION: ${{ steps.name.outputs.revision }}
+        run: ./build.sh
+
+      - name: Archive
+        env:
+          ARCHIVE: ffmpeg-lgpl-${{ steps.name.outputs.revision }}-${{ matrix.platform }}.tar.gz
+        run: |
+          mkdir -p dist
+          tar -czf "dist/$ARCHIVE" -C out ${{ matrix.platform }}
+          ls -l dist
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  source:
+    name: Source
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Source archive
+        run: |
+          revision=$(git describe --tags --always)
+          name="ffmpeg-lgpl-$revision-source"
+          ./build.sh --fetch
+          mkdir -p "dist/$name"
+          git archive HEAD | tar -x -C "dist/$name"
+          cp -R src "dist/$name/src"
+          tar -czf "dist/$name.tar.gz" -C dist "$name"
+          rm -rf "dist/$name"
+          ls -l dist
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: source
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Release
+    needs: [build, source]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          cd dist
+          sha256sum -- *.tar.gz >SHA256SUMS
+          cat SHA256SUMS
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "FFmpeg LGPL $TAG" \
+            --notes "LGPL-2.1-or-later shared libraries of FFmpeg built by build.sh at $TAG. Each archive's BUILD-INFO.txt lists the sources and the configure line; the source archive holds this repository and every upstream tarball." \
+            -- *.tar.gz SHA256SUMS
