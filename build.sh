@@ -125,7 +125,8 @@ case "$OS" in
     windows) need+=(cc objdump) ;;
 esac
 case "$ARCH" in x86_64 | i?86) need+=(nasm) ;; esac
-for tool in "${need[@]}"; do
+# Downloading needs none of them.
+[ "${1:-}" = --fetch ] || for tool in "${need[@]}"; do
     command -v "$tool" >/dev/null || { echo "missing build tool: $tool (see the top of $0)" >&2; exit 1; }
 done
 
@@ -140,7 +141,7 @@ if [ "$OS" = linux ]; then
 else
     export PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig"
 fi
-if [ "$OS" = windows ]; then
+if [ "$OS" = windows ] && [ "${1:-}" != --fetch ]; then
     # MinGW's runtimes and zlib statically: a directory searched before the
     # toolchain's that holds only their static archives (the linker takes
     # the first directory with a match, .dll.a or .a).
